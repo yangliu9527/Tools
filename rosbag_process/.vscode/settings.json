@@ -1,0 +1,11 @@
+{
+    "files.associations": {
+        "array": "cpp",
+        "string_view": "cpp",
+        "complex": "cpp",
+        "mutex": "cpp",
+        "condition_variable": "cpp",
+        "chrono": "cpp",
+        "bitset": "cpp"
+    }
+}
