@@ -19,6 +19,7 @@ import tf2_ros
 
 
 class RGBDLidarMatrixSync(Node):
+
     def __init__(self, output_dir: str):
         super().__init__('rgbd_lidar_matrix_sync')
 
@@ -28,26 +29,23 @@ class RGBDLidarMatrixSync(Node):
         self.output_dir = os.path.expanduser(output_dir)
         self.rgb_dir = os.path.join(self.output_dir, 'rgb')
         self.depth_dir = os.path.join(self.output_dir, 'depth')
-        self.pose_file = os.path.join(self.output_dir, 'poses.txt')
+
+        self.lio_pose_file = os.path.join(self.output_dir, 'lio-poses.txt')
+        self.cam_pose_file = os.path.join(self.output_dir, 'camera-poses.txt')
 
         os.makedirs(self.rgb_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
 
-        self.pose_fp = open(self.pose_file, 'a')
+        self.lio_pose_fp = open(self.lio_pose_file, 'a')
+        self.cam_pose_fp = open(self.cam_pose_file, 'a')
 
         self.get_logger().info(f'Data will be saved to: {self.output_dir}')
 
         # =============================
         # Frame definitions
         # =============================
-        # FAST-LIO
-        # self.map_frame = 'camera_init'
-        # self.lio_frame = 'body' 
-        # self.camera_frame = 'camera'
-
-        #lightning-lm
         self.map_frame = 'map'
-        self.lio_frame = 'lio' 
+        self.lio_frame = 'lio'
         self.camera_frame = 'camera'
 
         # =============================
@@ -57,6 +55,16 @@ class RGBDLidarMatrixSync(Node):
         self.tf_listener = tf2_ros.TransformListener(
             self.tf_buffer, self
         )
+
+        # =============================
+        # Pose saving timer
+        # =============================
+        self.timer = self.create_timer(
+            0.02, self.pose_timer_callback
+        )  # 50Hz
+
+        # 防止重复位姿
+        self.last_pose_stamp = None
 
         # =============================
         # CV bridge
@@ -69,122 +77,85 @@ class RGBDLidarMatrixSync(Node):
         rgb_sub = message_filters.Subscriber(
             self, Image, '/camera/color/image_raw'
         )
-        # depth_sub = message_filters.Subscriber(
-        #     self, Image, '/camera/aligned_depth_to_color/image_raw'
-        # )
         depth_sub = message_filters.Subscriber(
-            self, Image, '/camera/depth/image_raw'
+            self, Image, '/camera/aligned_depth_to_color/image_raw'
         )
 
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [rgb_sub, depth_sub],
             queue_size=10,
-            slop=0.03
+            slop=0.05
         )
-        self.sync.registerCallback(self.callback)
+
+        self.sync.registerCallback(self.rgbd_callback)
 
         # =============================
-        # Lidar -> Camera -> IMU extrinsic (4x4)
+        # Extrinsic
         # =============================
-        #D455
-        # self.T_cl = np.array([
-        # [0.03109787, -0.0627963,  0.99754175, -0.20589067],
-        # [0.99680206, -0.0627963,  0.04941931,  -0.10058281],
-        # [-0.02801317, 0.99754175, 0.06423174, -1.1367896],
-        # [0.0,         0.0,         0.0,         1.0]
-        # ], dtype=np.float64)
-
-        # 336L
         self.T_cl = np.array([
-        [0.09629, 0.98253, 0.15929, -0.33069],
-        [0-0.55413, -0.08002, 0.82858,  0.58819],
-        [0.82684, -0.16805, 0.53674, -0.17265],
-        [0.0,         0.0,         0.0,         1.0]
+            [0.03109787, -0.0627963,  0.99754175, -0.20589067],
+            [-0.0627963,  0.04941931,  0.99680206, -0.10058281],
+            [0.99754175, -0.02801317,  0.06423174, -1.1367896],
+            [0.0,         0.0,         0.0,         1.0]
         ], dtype=np.float64)
-
-
 
         self.T_lb = np.array([
             [1.0, 0.0, 0.0, 0.011],
             [0.0, 1.0, 0.0, 0.02329],
             [0.0, 0.0, 1.0, -0.04412],
-            [0.0, 0.0, 0.0, 1.00],
+            [0.0, 0.0, 0.0, 1.0]
         ], dtype=np.float64)
 
-
-        self.T_bc = np.linalg.inv(self.T_cl @ self.T_lb)
-
-
-        # self.T_bc = np.array(
-        #     [[-0.01658374, -0.06612253,  0.99769604, -0.08455519],
-        #      [ 1.00364341, -0.05075506,  0.0200464,   0.1859044 ],
-        #      [-0.05195012,  1.0016635,   0.06484486, -1.10611519],
-        #      [ 0.          ,  0.          ,  0.          , 1.        ]], dtype=np.float64)
+        # T_bc = (T_cl^-1 * T_lb)^-1
+        self.T_bc = np.linalg.inv(np.linalg.inv(self.T_cl) @ self.T_lb)
 
         self.get_logger().info('RGB-D + pose data collection started')
 
-    def callback(self, rgb_msg: Image, depth_msg: Image):
-        # =============================
-        # Timestamp (ROS time)
-        # =============================
+    # =========================================================
+    # RGBD callback (only save image)
+    # =========================================================
+    def rgbd_callback(self, rgb_msg: Image, depth_msg: Image):
+
         stamp = rgb_msg.header.stamp
         timestamp = f"{stamp.sec}.{stamp.nanosec:09d}"
-        ros_time = rclpy.time.Time.from_msg(stamp)
 
-        # =============================
-        # Lookup map -> lidar TF
-        # =============================
-        try:
-            tf_map_imu = self.tf_buffer.lookup_transform(
-                self.map_frame,
-                self.lio_frame,
-                ros_time,
-                timeout=rclpy.duration.Duration(seconds=0.03)
-            )
-        except Exception as e:
-            self.get_logger().warn(f'TF lookup failed: {e}')
-            return
-
-        # =============================
-        # Compute map -> camera
-        # =============================
-        T_wb = self.tf_to_matrix(tf_map_imu)
-        T_wc = T_wb @ self.T_bc
-
-        # =============================
-        # Save RGB
-        # =============================
+        # -----------------------------
+        # RGB
+        # -----------------------------
         rgb_img = self.bridge.imgmsg_to_cv2(
             rgb_msg, desired_encoding='bgr8'
         )
+
         cv2.imwrite(
             os.path.join(self.rgb_dir, f'{timestamp}.png'),
             rgb_img
         )
 
-        # =============================
-        # Save Depth (with encoding check)
-        # =============================
+        # -----------------------------
+        # Depth
+        # -----------------------------
         depth_encoding = depth_msg.encoding
+
         depth_img = self.bridge.imgmsg_to_cv2(
             depth_msg, desired_encoding='passthrough'
         )
 
         if depth_encoding == '16UC1':
-            # already in millimeters
+
             depth_to_save = depth_img.astype(np.uint16)
 
         elif depth_encoding == '32FC1':
-            # meters -> millimeters
-            depth_mm = depth_img * 1000.0
 
-            # 防止 NaN / inf / 负值
-            depth_mm = np.nan_to_num(depth_mm, nan=0.0, posinf=0.0, neginf=0.0)
+            depth_mm = depth_img * 1000.0
+            depth_mm = np.nan_to_num(
+                depth_mm, nan=0.0, posinf=0.0, neginf=0.0
+            )
             depth_mm[depth_mm < 0] = 0
 
             depth_to_save = depth_mm.astype(np.uint16)
 
         else:
+
             self.get_logger().warn(
                 f'Unsupported depth encoding: {depth_encoding}'
             )
@@ -195,56 +166,132 @@ class RGBDLidarMatrixSync(Node):
             depth_to_save
         )
 
+        self.get_logger().info(f'Saved RGBD @ {timestamp}')
+
+    # =========================================================
+    # Pose timer callback
+    # =========================================================
+    def pose_timer_callback(self):
+
+        try:
+
+            tf_map_lio = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.lio_frame,
+                rclpy.time.Time()
+            )
+
+        except Exception:
+            return
+
+        stamp = tf_map_lio.header.stamp
 
         # =============================
-        # Save Pose
+        # Skip duplicated pose
         # =============================
-        t = T_wc[0:3, 3]
-        R = T_wc[0:3, 0:3]
+        if self.last_pose_stamp is not None:
+
+            if (stamp.sec == self.last_pose_stamp.sec and
+                stamp.nanosec == self.last_pose_stamp.nanosec):
+                return
+
+        self.last_pose_stamp = stamp
+
+        timestamp = f"{stamp.sec}.{stamp.nanosec:09d}"
+
+        T_map_lio = self.tf_to_matrix(tf_map_lio)
+
+        # -----------------------------
+        # save LIO pose
+        # -----------------------------
+        self.write_pose(
+            self.lio_pose_fp,
+            timestamp,
+            T_map_lio
+        )
+
+        # -----------------------------
+        # compute camera pose
+        # -----------------------------
+        T_map_cam = T_map_lio @ self.T_bc
+
+        self.write_pose(
+            self.cam_pose_fp,
+            timestamp,
+            T_map_cam
+        )
+
+    # =========================================================
+    # Pose write helper
+    # =========================================================
+    def write_pose(self, fp, timestamp, T):
+
+        t = T[0:3, 3]
+        R = T[0:3, 0:3]
+
         qw, qx, qy, qz = tq.mat2quat(R)
 
-        self.pose_fp.write(
+        fp.write(
             f"{timestamp} "
             f"{t[0]} {t[1]} {t[2]} "
             f"{qx} {qy} {qz} {qw}\n"
         )
-        self.pose_fp.flush()
 
-        self.get_logger().info(f'Saved frame @ {timestamp}')
+        fp.flush()
 
+    # =========================================================
     @staticmethod
     def tf_to_matrix(tf_msg: TransformStamped) -> np.ndarray:
+
         t = tf_msg.transform.translation
         q = tf_msg.transform.rotation
 
-        R = tq.quat2mat([q.w, q.x, q.y, q.z])
+        R = tq.quat2mat(
+            [q.w, q.x, q.y, q.z]
+        )
 
-        T = np.eye(4, dtype=np.float64)
+        T = np.eye(4)
+
         T[0:3, 0:3] = R
         T[0:3, 3] = [t.x, t.y, t.z]
+
         return T
 
+    # =========================================================
     def destroy_node(self):
-        self.pose_fp.close()
+
+        self.lio_pose_fp.close()
+        self.cam_pose_fp.close()
+
         super().destroy_node()
 
 
+# =============================================================
 def main():
+
     parser = argparse.ArgumentParser(
         description='RGB-D + LiDAR pose data collector'
     )
+
     parser.add_argument(
         '--output_dir',
         type=str,
         default='~/rgbd_lio_dataset',
-        help='Output directory for rgb/depth/pose'
+        help='Output directory'
     )
+
     args = parser.parse_args()
 
     rclpy.init()
-    node = RGBDLidarMatrixSync(args.output_dir)
+
+    node = RGBDLidarMatrixSync(
+        args.output_dir
+    )
+
     rclpy.spin(node)
+
     node.destroy_node()
+
     rclpy.shutdown()
 
 
